@@ -25,3 +25,6 @@ media/
 # Operating system
 .DS_Store
 Thumbs.db
+
+# Generated static files
+staticfiles/
