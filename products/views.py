@@ -6,7 +6,7 @@ from rest_framework import generics
 from drf_spectacular.utils import extend_schema
 from rest_framework.permissions import AllowAny
 from django.db import transaction
-from .serializers import StockAdjustmentSerializers,CategorySerializer,PlaceOrderSerializer,OrderSerializer,CreatePaymentSerializer,PaymentSerializer,PaymentVerificationSerializer,ProductReviewSerializer
+from .serializers import StockAdjustmentSerializers,CategorySerializer,PlaceOrderSerializer,OrderSerializer,CreatePaymentSerializer,PaymentSerializer,PaymentVerificationSerializer,ProductReviewSerializer,DashboardSerializer
 from .models import Product,StockMovement,Category,Cart, CartItem,Order,OrderItem,Payment,ProductReview,Notification
 from .serializers import ProductSerializer, StockUpdateSerializer,StockMovementSerializer,CategorySerializer,CartSerializer,CartItemSerializer,UpdateCartItemSerializer,AddToCartSerializer,UpdateOrderStatusSerializer,NotificationSerializer
 from .permissions import IsAdminUserOrReadOnly
@@ -16,6 +16,7 @@ from decimal import Decimal
 import uuid
 from django.contrib.auth import get_user_model
 from django.db.models import Sum
+from rest_framework.exceptions import ValidationError
 
 class ProductListCreateView(generics.ListCreateAPIView):
     queryset = Product.objects.filter(is_active=True)
@@ -37,33 +38,20 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [IsAdminUserOrReadOnly]
 
 class ProductStockUpdateView(APIView):
+    serializer_class = StockUpdateSerializer
     permission_classes=[IsAdminUser]
     @extend_schema(request=StockUpdateSerializer)
-    def patch(self,request,pk):
-        try:
-            product=Product.objects.get(pk=pk)
-        except Product.DoesNotExist:
-            return Response(
-                {
-                    'error':'product not found'},
-                    status=status.HTTP_404_NOT_FOUND
+    
+    def patch(self, request, pk):
 
-            )
         serializer = StockUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         quantity = serializer.validated_data['stock_quantity']
+
         if quantity is None:
             return Response(
                 {'error': 'stock_quantity is required'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        try:
-            quantity = int(quantity)
-        except (ValueError, TypeError):
-            return Response(
-                {'error': 'Enter a valid whole number'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -73,14 +61,25 @@ class ProductStockUpdateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        product.stock_quantity = quantity
-        product.save(update_fields=['stock_quantity'])
+        with transaction.atomic():
+
+            try:
+                product = Product.objects.select_for_update().get(pk=pk)
+            except Product.DoesNotExist:
+                return Response(
+                    {'error': 'Product not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+            product.stock_quantity = quantity
+            product.save(update_fields=['stock_quantity'])
 
         return Response({
             'message': 'Stock updated successfully',
             'product': product.name,
             'stock_quantity': product.stock_quantity
-        })
+        }, status=status.HTTP_200_OK)
+
 class LowStockProductsView(generics.ListAPIView):
     serializer_class = ProductSerializer
     permission_classes = [IsAdminUser]
@@ -91,6 +90,7 @@ class LowStockProductsView(generics.ListAPIView):
     ).order_by('stock_quantity')
 
 class ProductStockAdjustmentView(APIView):
+    serializer_class = StockAdjustmentSerializers
     permission_classes=[IsAdminUser]
 
     @extend_schema(request=StockAdjustmentSerializers)
@@ -154,7 +154,7 @@ class StockMovementListView(generics.ListAPIView):
     permission_classes = [IsAdminUser]
 class CategoryListCreateAPIView(generics.ListCreateAPIView):
     serializer_class = CategorySerializer
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminUserOrReadOnly]
 
     def get_queryset(self):
         return Category.objects.filter(is_active=True).order_by('name')
@@ -162,7 +162,7 @@ class CategoryListCreateAPIView(generics.ListCreateAPIView):
 class CategoryDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminUserOrReadOnly]
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -180,6 +180,7 @@ class CategoryDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 class AddToCartView(APIView):
+    serializer_class = AddToCartSerializer
     permission_classes = [IsAuthenticated]
 
     @extend_schema(request=AddToCartSerializer)
@@ -198,6 +199,11 @@ class AddToCartView(APIView):
             )
 
             if not product.is_active:
+                if quantity > product.stock_quantity:
+                    return Response(
+                        {'error': 'Requested quantity exceeds available stock.'},
+                        status=status.HTTP_400_BAD_REQUEST
+    )
                 return Response(
                     {'error': 'Product is not available.'},
                     status=status.HTTP_400_BAD_REQUEST
@@ -235,7 +241,9 @@ class AddToCartView(APIView):
 
 
 class CartDetailView(APIView):
+    serializer_class = CartSerializer
     permission_classes = [IsAuthenticated]
+    
 
     def get(self, request):
 
@@ -252,6 +260,7 @@ class CartDetailView(APIView):
 
 
 class UpdateCartItemView(APIView):
+    serializer_class = UpdateCartItemSerializer
     permission_classes = [IsAuthenticated]
 
     @extend_schema(request=UpdateCartItemSerializer)
@@ -297,36 +306,21 @@ class UpdateCartItemView(APIView):
             status=status.HTTP_200_OK
         )
     def delete(self, request, pk):
-        cart_item = get_object_or_404(
-        CartItem,
-        pk=pk,
-        cart__user=request.user
-    )
-        cart_item.delete()
-        return Response(
-        {'message': 'Cart item removed successfully.'},
-        status=status.HTTP_200_OK
-    )
 
+        with transaction.atomic():
 
-class RemoveCartItemView(APIView):
-    permission_classes = [IsAuthenticated]
+            cart_item = get_object_or_404(
+                CartItem.objects.select_for_update(),
+                pk=pk,
+                cart__user=request.user
+            )
 
-    def delete(self, request, pk):
-
-        cart_item = get_object_or_404(
-            CartItem,
-            pk=pk,
-            cart__user=request.user
-        )
-
-        cart_item.delete()
+            cart_item.delete()
 
         return Response(
             {'message': 'Cart item removed successfully.'},
             status=status.HTTP_200_OK
         )
-
 class PlaceOrderView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -476,6 +470,9 @@ class OrderListView(generics.ListAPIView):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return Order.objects.none()
+
         return Order.objects.filter(
             user=self.request.user
         ).prefetch_related('items')
@@ -493,6 +490,7 @@ class OrderDetailView(generics.RetrieveAPIView):
         ).prefetch_related('items')
 
 class CancelOrderView(APIView):
+    serializer_class = OrderSerializer
 
     permission_classes = [IsAuthenticated]
 
@@ -560,6 +558,15 @@ class CancelOrderView(APIView):
                 )
 
             # Update order status
+            # Mark successful payments as refunded
+            Payment.objects.filter(
+                order=order,
+                payment_status='successful'
+            ).update(
+                payment_status='refunded'
+            )
+
+            # Update order status
             order.status = 'cancelled'
             order.save(update_fields=['status', 'updated_at'])
 
@@ -572,6 +579,7 @@ class CancelOrderView(APIView):
         )
 
 class UpdateOrderStatusView(APIView):
+    serializer_class = UpdateOrderStatusSerializer
 
     permission_classes = [IsAdminUser]
 
@@ -630,10 +638,12 @@ class UpdateOrderStatusView(APIView):
         )
 
 class CreatePaymentView(APIView):
+    serializer_class = CreatePaymentSerializer
 
     permission_classes = [IsAuthenticated]
 
     @extend_schema(request=CreatePaymentSerializer)
+    
     def post(self, request):
 
         serializer = CreatePaymentSerializer(data=request.data)
@@ -642,41 +652,48 @@ class CreatePaymentView(APIView):
         order_id = serializer.validated_data['order']
         payment_method = serializer.validated_data['payment_method']
 
-        # Get only the logged-in user's order
-        order = get_object_or_404(
-            Order,
-            id=order_id,
-            user=request.user
-        )
+        with transaction.atomic():
 
-        # Only pending or confirmed orders can be paid
-        if order.status not in ['pending', 'confirmed']:
-            return Response(
-                {
-                    'error': 'Payment is not allowed for this order.'
-                },
-                status=status.HTTP_400_BAD_REQUEST
+            # Lock the order belonging to the logged-in user
+            order = get_object_or_404(
+                Order.objects.select_for_update(),
+                id=order_id,
+                user=request.user
             )
 
-        # Check whether the order is already paid
-        if Payment.objects.filter(
-            order=order,
-            payment_status='successful'
-        ).exists():
+            # Validate order status
+            if order.status not in ['pending', 'confirmed']:
+                return Response(
+                    {'error': 'Payment is not allowed for this order.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
-            return Response(
-                {
-                    'error': 'This order has already been paid.'
-                },
-                status=status.HTTP_400_BAD_REQUEST
+            # Check for an existing successful payment
+            if Payment.objects.filter(
+                order=order,
+                payment_status='successful'
+            ).exists():
+                return Response(
+                    {'error': 'This order has already been paid.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Prevent multiple pending payment attempts
+            if Payment.objects.filter(
+                order=order,
+                payment_status='pending'
+            ).exists():
+                return Response(
+                    {'error': 'A payment is already pending for this order.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            payment = Payment.objects.create(
+                order=order,
+                payment_method=payment_method,
+                amount=order.total_amount,
+                payment_status='pending'
             )
-
-        payment = Payment.objects.create(
-            order=order,
-            payment_method=payment_method,
-            amount=order.total_amount,
-            payment_status='pending'
-        )
 
         return Response(
             {
@@ -686,7 +703,9 @@ class CreatePaymentView(APIView):
             status=status.HTTP_201_CREATED
         )
 
+
 class VerifyPaymentView(APIView):
+    serializer_class = PaymentVerificationSerializer
 
     permission_classes = [IsAuthenticated]
 
@@ -752,10 +771,12 @@ class PaymentHistoryView(generics.ListAPIView):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return Payment.objects.none()
 
         return Payment.objects.filter(
             order__user=self.request.user
-        ).select_related('order')
+         ).select_related('order')
 
 class ProductReviewListCreateView(generics.ListCreateAPIView):
 
@@ -782,7 +803,7 @@ class ProductReviewListCreateView(generics.ListCreateAPIView):
 
         product = serializer.validated_data['product']
 
-        # Check whether the customer has purchased this product
+        # Check whether the customer has purchased and received the product
         has_purchased = OrderItem.objects.filter(
             product=product,
             order__user=self.request.user,
@@ -790,8 +811,19 @@ class ProductReviewListCreateView(generics.ListCreateAPIView):
         ).exists()
 
         if not has_purchased:
-            raise serializer.ValidationError(
+            raise ValidationError(
                 "You can review a product only after purchasing and receiving it."
+            )
+
+        # Prevent duplicate reviews
+        already_reviewed = ProductReview.objects.filter(
+            product=product,
+            user=self.request.user
+        ).exists()
+
+        if already_reviewed:
+            raise ValidationError(
+                "You have already reviewed this product."
             )
 
         serializer.save(user=self.request.user)
@@ -812,6 +844,9 @@ class NotificationListView(generics.ListAPIView):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return Notification.objects.none()
+
         return Notification.objects.filter(
             user=self.request.user
         )
@@ -828,6 +863,7 @@ class MarkNotificationReadView(generics.UpdateAPIView):
         )
 
 class DashboardView(APIView):
+    serializer_class = DashboardSerializer
 
     permission_classes = [IsAdminUser]
 

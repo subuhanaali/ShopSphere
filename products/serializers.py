@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import Product,StockMovement,Category,Cart,CartItem,Order,OrderItem,Payment,ProductReview,Notification
 from decimal import Decimal
-
+from drf_spectacular.utils import extend_schema_field
 
 
 class ProductSerializer(serializers.ModelSerializer):
@@ -154,10 +154,11 @@ class CartItemSerializer(serializers.ModelSerializer):
         ]
 
         read_only_fields = fields
-
+    @extend_schema_field(serializers.DecimalField(max_digits=10, decimal_places=2))
     def get_unit_price(self, obj):
         return obj.product.discount_price or obj.product.price
-
+    
+    @extend_schema_field(serializers.DecimalField(max_digits=10, decimal_places=2))
     def get_subtotal(self, obj):
         price = self.get_unit_price(obj)
         return price * obj.quantity
@@ -183,10 +184,10 @@ class CartSerializer(serializers.ModelSerializer):
         ]
 
         read_only_fields = fields
-
+    @extend_schema_field(serializers.IntegerField())
     def get_total_items(self, obj):
         return sum(item.quantity for item in obj.items.all())
-
+    @extend_schema_field(serializers.DecimalField(max_digits=10, decimal_places=2))
     def get_total_price(self, obj):
         total = Decimal('0.00')
 
@@ -372,3 +373,13 @@ class NotificationSerializer(serializers.ModelSerializer):
             'notification_type',
             'created_at'
         ]
+class DashboardSerializer(serializers.Serializer):
+    total_customers = serializers.IntegerField()
+    total_products = serializers.IntegerField()
+    total_categories = serializers.IntegerField()
+    total_orders = serializers.IntegerField()
+    pending_orders = serializers.IntegerField()
+    total_revenue = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2
+    )
